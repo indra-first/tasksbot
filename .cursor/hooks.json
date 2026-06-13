@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "afterFileEdit": [
+      {
+        "command": "python -m py_compile \"${file}\"",
+        "matcher": "\\.py$"
+      }
+    ]
+  }
+}

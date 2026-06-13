@@ -1,0 +1,52 @@
+---
+description: Python coding standards for the Telegram bot project
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Python Bot Standards
+
+## Logging
+Use `logging` instead of `print`. Every module must have its own logger:
+```python
+# ✅ GOOD
+logger = logging.getLogger(__name__)
+logger.info("Task saved: %d", task_id)
+
+# ❌ BAD
+print(f"Task saved: {task_id}")
+```
+
+## Type hints
+Always annotate function signatures with types. Use `Optional[T]` for nullable returns.
+```python
+# ✅ GOOD
+def save_task(user_id: int, text: str, deadline: datetime) -> int: ...
+
+# ❌ BAD
+def save_task(user_id, text, deadline): ...
+```
+
+## Exception handling in handlers
+Wrap external calls (DB, Telegram API) in try/except and log the error.
+```python
+# ✅ GOOD
+try:
+    await context.bot.send_message(...)
+except Exception:
+    logger.exception("Failed to send message to user %d", user_id)
+
+# ❌ BAD
+await context.bot.send_message(...)  # unhandled, will crash the handler
+```
+
+## Datetime always timezone-aware
+All `datetime` objects must carry a `tzinfo` (use `ZoneInfo`). Never use naive datetimes.
+```python
+# ✅ GOOD
+from zoneinfo import ZoneInfo
+deadline = datetime(2026, 6, 12, 14, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+# ❌ BAD
+deadline = datetime(2026, 6, 12, 14, 0)
+```
