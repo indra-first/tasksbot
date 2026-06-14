@@ -141,7 +141,7 @@ _DURATION_RE = re.compile(
     r"\bчерез\s+(\d+)\s+(минут[уы]?|час[аов]*)\b", re.IGNORECASE
 )
 _WEEKDAY_TIME_RE = re.compile(
-    r"\bв\s+(" + "|".join(WEEKDAYS_RU) + r")\b(?:\s+(\d{1,2}):(\d{2}))?",
+    r"\bв\s+(" + "|".join(WEEKDAYS_RU) + r")\b(?:\s+(?:в\s+)?(\d{1,2}):(\d{2}))?",
     re.IGNORECASE,
 )
 

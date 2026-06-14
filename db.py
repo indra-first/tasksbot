@@ -63,14 +63,14 @@ def save_task(
     user_id: int,
     text: str,
     deadline: datetime,
-    reminder_minutes: int = 10,
+    reminder_minutes: Optional[int] = None,
     recurrence: Optional[str] = None,
 ) -> int:
     with get_connection() as conn:
         cur = conn.execute(
             """INSERT INTO tasks (user_id, text, deadline, reminder_minutes, recurrence)
                VALUES (?, ?, ?, ?, ?)""",
-            (user_id, text, deadline.isoformat(), reminder_minutes, recurrence),
+            (user_id, text, deadline.isoformat(), reminder_minutes or 0, recurrence),
         )
         conn.commit()
     task_id: int = cur.lastrowid
