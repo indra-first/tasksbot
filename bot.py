@@ -140,6 +140,23 @@ _TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
 _DURATION_RE = re.compile(
     r"\bчерез\s+(\d+)\s+(минут[уы]?|час[аов]*)\b", re.IGNORECASE
 )
+# "в 6 вечера", "в 9 утра", "в 3 дня", "в 11 ночи"
+_AMPM_RE = re.compile(
+    r"\bв\s+(\d{1,2})(?::(\d{2}))?\s+(утра|утром|дня|днём|вечера|вечером|ночи|ночью)\b",
+    re.IGNORECASE,
+)
+
+def _ampm_to_hour(h: int, period: str) -> int:
+    """Конвертирует '6 вечера' → 18, '9 утра' → 9, '11 ночи' → 23."""
+    p = period.lower()
+    if p in ("утра", "утром"):
+        return h % 12  # 12 утра = 00:00, 6 утра = 06:00
+    if p in ("дня", "днём", "вечера", "вечером"):
+        return h if h == 12 else h + 12  # 12 дня = 12:00, 6 вечера = 18:00
+    # ночи / ночью: 12 ночи = 00:00, 9-11 ночи = 21-23, 1-8 ночи = 01-08
+    if h == 12:
+        return 0
+    return h + 12 if h >= 9 else h
 _WEEKDAY_TIME_RE = re.compile(
     r"\bв\s+(" + "|".join(WEEKDAYS_RU) + r")\b(?:\s+(?:в\s+)?(\d{1,2}):(\d{2}))?",
     re.IGNORECASE,
@@ -269,6 +286,16 @@ def parse_task(raw: str) -> Optional[ParsedTask]:
         )
         desc = re.sub(r"завтра\s+\d{1,2}:\d{2}", "", text, flags=re.IGNORECASE).strip(" ,.-") or raw.strip()
         return ParsedTask(desc, deadline, _resolve_reminder(deadline, rel_min, at_hm), recurrence)
+
+    # "в 6 вечера", "в 9 утра", "в 3 дня", "в 11 ночи"
+    m = _AMPM_RE.search(text)
+    if m:
+        h = _ampm_to_hour(int(m.group(1)), m.group(3))
+        mn = int(m.group(2)) if m.group(2) else 0
+        deadline = now.replace(hour=h, minute=mn, second=0, microsecond=0)
+        if deadline <= now:
+            deadline += timedelta(days=1)
+        return ParsedTask(_clean(text, m), deadline, _resolve_reminder(deadline, rel_min, at_hm), recurrence)
 
     # сегодня HH:MM или просто HH:MM
     m = _TIME_RE.search(text)
@@ -724,9 +751,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    task_id = db.save_task(
-        user_id, parsed.text, parsed.deadline, parsed.reminder_minutes, parsed.recurrence
-    )
+    try:
+        task_id = db.save_task(
+            user_id, parsed.text, parsed.deadline, parsed.reminder_minutes, parsed.recurrence
+        )
+    except Exception:
+        logger.exception("Failed to save task for user %d.", user_id)
+        await update.message.reply_text("⚠️ Не удалось сохранить задачу. Попробуй ещё раз.")
+        return
+
     _schedule_task(
         context.application, task_id, user_id, parsed.text,
         parsed.deadline, parsed.reminder_minutes, parsed.recurrence,
