@@ -1,3 +1,4 @@
+import random
 import sqlite3
 import logging
 from datetime import datetime
@@ -25,7 +26,9 @@ def init_db() -> None:
                 status           TEXT    NOT NULL DEFAULT 'active',
                 notified         INTEGER NOT NULL DEFAULT 0,
                 reminder_minutes INTEGER NOT NULL DEFAULT 10,
-                recurrence       TEXT
+                recurrence       TEXT,
+                priority         INTEGER NOT NULL DEFAULT 0,
+                category         TEXT
             )
             """
         )
@@ -34,6 +37,24 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id     INTEGER PRIMARY KEY,
                 digest_time TEXT NOT NULL DEFAULT 'off'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS family_links (
+                user_id    INTEGER NOT NULL,
+                partner_id INTEGER NOT NULL,
+                PRIMARY KEY (user_id, partner_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS family_invites (
+                code       TEXT    PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                created_at TEXT    NOT NULL
             )
             """
         )
@@ -48,6 +69,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "status": "TEXT NOT NULL DEFAULT 'active'",
         "reminder_minutes": "INTEGER NOT NULL DEFAULT 10",
         "recurrence": "TEXT",
+        "priority": "INTEGER NOT NULL DEFAULT 0",
+        "category": "TEXT",
     }
     for col, definition in additions.items():
         if col not in existing:
@@ -65,16 +88,19 @@ def save_task(
     deadline: datetime,
     reminder_minutes: Optional[int] = None,
     recurrence: Optional[str] = None,
+    priority: int = 0,
+    category: Optional[str] = None,
 ) -> int:
     with get_connection() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (user_id, text, deadline, reminder_minutes, recurrence)
-               VALUES (?, ?, ?, ?, ?)""",
-            (user_id, text, deadline.isoformat(), reminder_minutes or 0, recurrence),
+            """INSERT INTO tasks (user_id, text, deadline, reminder_minutes, recurrence, priority, category)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, text, deadline.isoformat(), reminder_minutes or 0, recurrence, priority, category),
         )
         conn.commit()
     task_id: int = cur.lastrowid
-    logger.info("Saved task %d for user %d: '%s' @ %s", task_id, user_id, text, deadline)
+    logger.info("Saved task %d for user %d: '%s' @ %s (priority=%d, cat=%s)",
+                task_id, user_id, text, deadline, priority, category)
     return task_id
 
 
@@ -87,12 +113,12 @@ def get_pending_tasks(user_id: Optional[int] = None) -> list[sqlite3.Row]:
     with get_connection() as conn:
         if user_id is not None:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE user_id=? AND status='active' AND notified=0 ORDER BY deadline",
+                "SELECT * FROM tasks WHERE user_id=? AND status='active' AND notified=0 ORDER BY priority DESC, deadline",
                 (user_id,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE status='active' AND notified=0 ORDER BY deadline"
+                "SELECT * FROM tasks WHERE status='active' AND notified=0 ORDER BY priority DESC, deadline"
             ).fetchall()
     return rows
 
@@ -105,8 +131,20 @@ def get_tasks_for_range(
             """SELECT * FROM tasks
                WHERE user_id=? AND status='active'
                AND deadline >= ? AND deadline < ?
-               ORDER BY deadline""",
+               ORDER BY priority DESC, deadline""",
             (user_id, start.isoformat(), end.isoformat()),
+        ).fetchall()
+    return rows
+
+
+def get_overdue_tasks(user_id: int) -> list[sqlite3.Row]:
+    now = datetime.now().astimezone()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM tasks
+               WHERE user_id=? AND status='active' AND deadline < ?
+               ORDER BY priority DESC, deadline""",
+            (user_id, now.isoformat()),
         ).fetchall()
     return rows
 
@@ -169,6 +207,34 @@ def update_task(
     return updated
 
 
+def set_task_category(task_id: int, category: Optional[str]) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE tasks SET category=? WHERE id=?", (category, task_id))
+        conn.commit()
+    logger.info("Set category=%s for task %d.", category, task_id)
+
+
+def set_task_priority(task_id: int, priority: int) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE tasks SET priority=? WHERE id=?", (priority, task_id))
+        conn.commit()
+    logger.info("Set priority=%d for task %d.", priority, task_id)
+
+
+def reschedule_task(task_id: int, new_deadline: datetime) -> bool:
+    """Переносит дедлайн задачи (для снуза и /overdue reschedule)."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET deadline=?, notified=0 WHERE id=? AND status='active'",
+            (new_deadline.isoformat(), task_id),
+        )
+        conn.commit()
+    updated = cur.rowcount > 0
+    if updated:
+        logger.info("Rescheduled task %d to %s.", task_id, new_deadline)
+    return updated
+
+
 # ---------------------------------------------------------------------------
 # User settings
 # ---------------------------------------------------------------------------
@@ -203,3 +269,64 @@ def get_all_users() -> list[int]:
     with get_connection() as conn:
         rows = conn.execute("SELECT DISTINCT user_id FROM tasks").fetchall()
     return [row["user_id"] for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Family linking
+# ---------------------------------------------------------------------------
+
+def create_family_invite(user_id: int) -> str:
+    """Создаёт 6-значный код приглашения. Старые коды пользователя удаляются."""
+    code = str(random.randint(100000, 999999))
+    now_iso = datetime.now().isoformat()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM family_invites WHERE user_id=?", (user_id,))
+        conn.execute(
+            "INSERT INTO family_invites (code, user_id, created_at) VALUES (?, ?, ?)",
+            (code, user_id, now_iso),
+        )
+        conn.commit()
+    logger.info("Created family invite code %s for user %d.", code, user_id)
+    return code
+
+
+def accept_family_invite(code: str, acceptor_id: int) -> Optional[int]:
+    """Принимает приглашение. Возвращает user_id отправителя или None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM family_invites WHERE code=?", (code,)
+        ).fetchone()
+        if not row:
+            return None
+        inviter_id: int = row["user_id"]
+        if inviter_id == acceptor_id:
+            return None
+        conn.execute("DELETE FROM family_invites WHERE code=?", (code,))
+        # Двусторонняя связь
+        conn.execute(
+            "INSERT OR REPLACE INTO family_links (user_id, partner_id) VALUES (?, ?)",
+            (inviter_id, acceptor_id),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO family_links (user_id, partner_id) VALUES (?, ?)",
+            (acceptor_id, inviter_id),
+        )
+        conn.commit()
+    logger.info("Family linked: %d <-> %d.", inviter_id, acceptor_id)
+    return inviter_id
+
+
+def get_family_partner(user_id: int) -> Optional[int]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT partner_id FROM family_links WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return row["partner_id"] if row else None
+
+
+def unlink_family(user_id: int) -> None:
+    partner_id = get_family_partner(user_id)
+    with get_connection() as conn:
+        conn.execute("DELETE FROM family_links WHERE user_id=? OR partner_id=?", (user_id, user_id))
+        conn.commit()
+    logger.info("Unlinked family for user %d (partner was %s).", user_id, partner_id)
