@@ -9,7 +9,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1223,6 +1223,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def on_startup(app: Application) -> None:
     db.init_db()
+
+    await app.bot.set_my_commands([
+        BotCommand("start",     "Начало работы"),
+        BotCommand("list",      "Все активные задачи"),
+        BotCommand("today",     "Задачи на сегодня"),
+        BotCommand("week",      "Задачи на неделю"),
+        BotCommand("overdue",   "Просроченные задачи"),
+        BotCommand("done",      "Отметить задачу выполненной"),
+        BotCommand("del",       "Удалить задачу"),
+        BotCommand("edit",      "Редактировать задачу"),
+        BotCommand("history",   "История выполненных задач"),
+        BotCommand("setdigest", "Настроить время дайджеста"),
+        BotCommand("family",    "Семейный список задач"),
+        BotCommand("help",      "Помощь и инструкция"),
+    ])
 
     pending = db.get_pending_tasks()
     for t in pending:
