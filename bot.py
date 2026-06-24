@@ -757,6 +757,8 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         job.schedule_removal()
     if db.mark_done(task_id, user_id):
         await update.message.reply_text(f"✅ Задача #{task_id} выполнена! Молодец 🎉")
+        actor = update.effective_user.first_name or "Партнёр"
+        await _cascade_family_status(context, task_id, "done", actor)
     else:
         await update.message.reply_text("❌ Задача не найдена или уже выполнена.")
 
@@ -771,6 +773,8 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         job.schedule_removal()
     if db.delete_task(task_id, user_id):
         await update.message.reply_text(f"🗑 Задача #{task_id} удалена.")
+        actor = update.effective_user.first_name or "Партнёр"
+        await _cascade_family_status(context, task_id, "delete", actor)
     else:
         await update.message.reply_text("❌ Задача не найдена.")
 
@@ -805,6 +809,32 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown",
             reply_markup=_task_keyboard(task_id),
         )
+        # Каскад на партнёрскую копию семейной задачи
+        updated = db.get_task(task_id)
+        linked_id = updated["linked_task_id"] if updated and "linked_task_id" in updated.keys() else None
+        if linked_id:
+            linked = db.get_task(linked_id)
+            if linked and linked["status"] == "active":
+                partner_id = linked["user_id"]
+                for job in context.application.job_queue.get_jobs_by_name(f"task_{linked_id}"):
+                    job.schedule_removal()
+                db.update_task_force(linked_id, parsed.text, parsed.deadline)
+                _schedule_task(context.application, linked_id, partner_id, parsed.text,
+                               parsed.deadline, linked["reminder_minutes"], linked["recurrence"])
+                actor = update.effective_user.first_name or "Партнёр"
+                try:
+                    await context.bot.send_message(
+                        chat_id=partner_id,
+                        text=(
+                            f"✏️ *{actor}* изменил семейную задачу:\n\n"
+                            f"📝 *{parsed.text}*\n"
+                            f"🕐 {parsed.deadline.strftime('%d.%m.%Y %H:%M')}"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=_task_keyboard(linked_id),
+                    )
+                except Exception:
+                    logger.exception("Failed to notify partner %d about edit.", partner_id)
     else:
         await update.message.reply_text("❌ Задача не найдена.")
 
@@ -927,32 +957,60 @@ async def cmd_family(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def _notify_family_partner(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
+async def _create_family_copy(
+    app: Application,
+    partner_id: int,
     task_id: int,
-    parsed: ParsedTask,
-    rem_note: str,
+    task: "sqlite3.Row",
 ) -> None:
-    """Уведомляет партнёра, если задача относится к категории 'семья'."""
-    if parsed.category != "семья":
+    """Создаёт копию семейной задачи для партнёра и связывает обе."""
+    deadline = datetime.fromisoformat(task["deadline"])
+    reminder_minutes = task["reminder_minutes"] or None
+    partner_task_id = db.save_task(
+        partner_id,
+        task["text"],
+        deadline,
+        reminder_minutes,
+        task["recurrence"],
+        task["priority"],
+        "семья",
+    )
+    db.link_tasks(task_id, partner_task_id)
+    _schedule_task(app, partner_task_id, partner_id, task["text"],
+                   deadline, reminder_minutes, task["recurrence"])
+    _schedule_auto_digests(app, partner_id)
+    logger.info("Family copy created: task %d -> partner task %d.", task_id, partner_task_id)
+
+
+async def _cascade_family_status(
+    context: ContextTypes.DEFAULT_TYPE,
+    task_id: int,
+    action: str,
+    actor_name: str,
+) -> None:
+    """Каскадирует done/delete на связанную задачу партнёра и уведомляет его."""
+    task = db.get_task(task_id)
+    if not task:
         return
-    partner_id = db.get_family_partner(user_id)
-    if not partner_id:
+    linked_id = task["linked_task_id"] if "linked_task_id" in task.keys() else None
+    if not linked_id:
         return
+    linked = db.get_task(linked_id)
+    if not linked or linked["status"] != "active":
+        return
+    partner_id = linked["user_id"]
+    for job in context.application.job_queue.get_jobs_by_name(f"task_{linked_id}"):
+        job.schedule_removal()
+    if action == "done":
+        db.mark_done_force(linked_id)
+        msg = f"✅ *{actor_name}* выполнил семейную задачу:\n\n📝 *{task['text']}*"
+    else:
+        db.delete_task_force(linked_id)
+        msg = f"🗑 *{actor_name}* удалил семейную задачу:\n\n📝 *{task['text']}*"
     try:
-        await context.bot.send_message(
-            chat_id=partner_id,
-            text=(
-                f"👨‍👩‍👦 *Семейная задача:*\n\n"
-                f"📝 *{parsed.text}*\n"
-                f"🕐 {parsed.deadline.strftime('%d.%m.%Y %H:%M')}{rem_note}"
-            ),
-            parse_mode="Markdown",
-            reply_markup=_task_keyboard(task_id),
-        )
+        await context.bot.send_message(chat_id=partner_id, text=msg, parse_mode="Markdown")
     except Exception:
-        logger.exception("Failed to notify family partner %d.", partner_id)
+        logger.exception("Failed to notify partner %d about family task %s.", partner_id, action)
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1027,8 +1085,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown",
             reply_markup=_priority_keyboard(task_id),
         )
-        # Уведомляем партнёра по семейным задачам (категория уже задана)
-        await _notify_family_partner(context, user_id, task_id, parsed, rem_note)
+        if parsed.category == "семья":
+            partner_id = db.get_family_partner(user_id)
+            if partner_id:
+                saved = db.get_task(task_id)
+                await _create_family_copy(context.application, partner_id, task_id, saved)
     else:
         await update.message.reply_text(
             f"✅ Задача добавлена!{pri_note}\n\n"
@@ -1038,7 +1099,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown",
             reply_markup=_task_keyboard(task_id),
         )
-        await _notify_family_partner(context, user_id, task_id, parsed, rem_note)
+        if parsed.category == "семья":
+            partner_id = db.get_family_partner(user_id)
+            if partner_id:
+                saved = db.get_task(task_id)
+                await _create_family_copy(context.application, partner_id, task_id, saved)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1054,6 +1119,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if db.mark_done(task_id, user_id):
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(f"✅ Задача #{task_id} выполнена! Молодец 🎉")
+            actor = query.from_user.first_name or "Партнёр"
+            await _cascade_family_status(context, task_id, "done", actor)
         else:
             await query.answer("Задача не найдена или уже выполнена.", show_alert=True)
 
@@ -1064,6 +1131,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if db.delete_task(task_id, user_id):
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(f"🗑 Задача #{task_id} удалена.")
+            actor = query.from_user.first_name or "Партнёр"
+            await _cascade_family_status(context, task_id, "delete", actor)
         else:
             await query.answer("Задача не найдена.", show_alert=True)
 
@@ -1113,25 +1182,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="Markdown",
             reply_markup=_priority_keyboard(task_id),
         )
-        # Уведомляем партнёра если выбрана "семья"
+        # Создаём копию задачи для партнёра если выбрана "семья"
         if category == "семья":
             partner_id = db.get_family_partner(user_id)
             if partner_id:
-                try:
-                    dl = datetime.fromisoformat(task["deadline"])
-                    sender_name = query.from_user.first_name or "Партнёр"
-                    await context.bot.send_message(
-                        chat_id=partner_id,
-                        text=(
-                            f"👨‍👩‍👦 *Семейная задача от {sender_name}:*\n\n"
-                            f"📝 *{task['text']}*\n"
-                            f"🕐 {dl.strftime('%d.%m.%Y %H:%M')}"
-                        ),
-                        parse_mode="Markdown",
-                        reply_markup=_task_keyboard(task_id),
-                    )
-                except Exception:
-                    logger.exception("Failed to notify family partner %d.", partner_id)
+                fresh = db.get_task(task_id)
+                await _create_family_copy(context.application, partner_id, task_id, fresh)
 
     elif data.startswith("pri:"):
         parts = data.split(":", 2)
@@ -1142,6 +1198,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Задача не найдена.", show_alert=True)
             return
         db.set_task_priority(task_id, priority)
+        # Синхронизируем приоритет на связанной задаче партнёра
+        linked_id = task["linked_task_id"] if "linked_task_id" in task.keys() else None
+        if linked_id:
+            db.set_task_priority(linked_id, priority)
         dl = datetime.fromisoformat(task["deadline"])
         cat_note = f" #{task['category']}" if task["category"] else ""
         pri_emoji = PRIORITY_EMOJI.get(priority, "")

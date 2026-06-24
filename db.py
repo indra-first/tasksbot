@@ -71,6 +71,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "recurrence": "TEXT",
         "priority": "INTEGER NOT NULL DEFAULT 0",
         "category": "TEXT",
+        "linked_task_id": "INTEGER",
     }
     for col, definition in additions.items():
         if col not in existing:
@@ -205,6 +206,42 @@ def update_task(
     if updated:
         logger.info("Updated task %d.", task_id)
     return updated
+
+
+def link_tasks(task_id_1: int, task_id_2: int) -> None:
+    """Связывает две копии семейной задачи друг с другом."""
+    with get_connection() as conn:
+        conn.execute("UPDATE tasks SET linked_task_id=? WHERE id=?", (task_id_2, task_id_1))
+        conn.execute("UPDATE tasks SET linked_task_id=? WHERE id=?", (task_id_1, task_id_2))
+        conn.commit()
+    logger.info("Linked tasks %d <-> %d.", task_id_1, task_id_2)
+
+
+def mark_done_force(task_id: int) -> None:
+    """Отмечает задачу выполненной без проверки владельца (каскад)."""
+    with get_connection() as conn:
+        conn.execute("UPDATE tasks SET status='done' WHERE id=? AND status='active'", (task_id,))
+        conn.commit()
+    logger.info("Force-marked task %d as done.", task_id)
+
+
+def delete_task_force(task_id: int) -> None:
+    """Удаляет задачу без проверки владельца (каскад)."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        conn.commit()
+    logger.info("Force-deleted task %d.", task_id)
+
+
+def update_task_force(task_id: int, text: str, deadline: datetime) -> None:
+    """Обновляет текст и дедлайн задачи без проверки владельца (каскад edit)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE tasks SET text=?, deadline=?, notified=0 WHERE id=? AND status='active'",
+            (text, deadline.isoformat(), task_id),
+        )
+        conn.commit()
+    logger.info("Force-updated task %d.", task_id)
 
 
 def set_task_category(task_id: int, category: Optional[str]) -> None:
