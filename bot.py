@@ -690,7 +690,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tasks = db.get_pending_tasks(update.effective_user.id)
+    tasks = db.get_active_tasks(update.effective_user.id)
     if not tasks:
         await update.message.reply_text("📭 Нет активных задач.")
         return

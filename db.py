@@ -4,7 +4,8 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-DB_PATH = "tasks.db"
+import os as _os
+DB_PATH = _os.path.join(_os.getenv("DATA_DIR", "."), "tasks.db")
 logger = logging.getLogger(__name__)
 
 
@@ -111,6 +112,7 @@ def get_task(task_id: int) -> Optional[sqlite3.Row]:
 
 
 def get_pending_tasks(user_id: Optional[int] = None) -> list[sqlite3.Row]:
+    """Задачи с notified=0 — только для восстановления напоминаний при старте бота."""
     with get_connection() as conn:
         if user_id is not None:
             rows = conn.execute(
@@ -121,6 +123,16 @@ def get_pending_tasks(user_id: Optional[int] = None) -> list[sqlite3.Row]:
             rows = conn.execute(
                 "SELECT * FROM tasks WHERE status='active' AND notified=0 ORDER BY priority DESC, deadline"
             ).fetchall()
+    return rows
+
+
+def get_active_tasks(user_id: int) -> list[sqlite3.Row]:
+    """Все активные задачи пользователя для отображения (/list и т.п.)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE user_id=? AND status='active' ORDER BY priority DESC, deadline",
+            (user_id,),
+        ).fetchall()
     return rows
 
 
