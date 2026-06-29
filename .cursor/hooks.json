@@ -3,8 +3,16 @@
   "hooks": {
     "afterFileEdit": [
       {
-        "command": "python -m py_compile \"${file}\"",
-        "matcher": "\\.py$"
+        "command": "python .cursor/hooks/check-syntax.py",
+        "matcher": "\\.py$",
+        "timeout": 15
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "type": "prompt",
+        "prompt": "The user is working on «Быстрый задачник» — a Russian Telegram task-management bot. Before answering, confirm you understand these critical rules:\n1. Task creation uses ONE message only (edit in place via query.edit_message_text, never reply_text for cat:/pri: steps).\n2. The parser in parse_task() checks patterns top-to-bottom — new patterns must fit into the priority order documented in .cursor/skills/tasksbot-context/SKILL.md.\n3. All datetimes must be timezone-aware (ZoneInfo('Europe/Moscow')).\n4. The /edit command now uses an interactive picker (no ID required from user).\n5. Morning digest shows overdue tasks as a separate section, not mixed with today's tasks.\nIf this prompt is about something unrelated to the bot, ignore these rules and answer normally. Here is the user's prompt: $ARGUMENTS",
+        "timeout": 20
       }
     ]
   }

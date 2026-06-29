@@ -57,6 +57,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Sentry error tracking (optional — set SENTRY_DSN in .env to enable)
+# ---------------------------------------------------------------------------
+
+def _init_sentry() -> None:
+    dsn = _ENV.get("SENTRY_DSN") or os.getenv("SENTRY_DSN")
+    if not dsn:
+        return
+    try:
+        import sentry_sdk
+        sentry_sdk.init(
+            dsn=dsn,
+            traces_sample_rate=0.1,
+            profiles_sample_rate=0.0,
+        )
+        logger.info("Sentry initialized.")
+    except Exception:
+        logger.warning("Failed to initialize Sentry — continuing without it.")
+
+_init_sentry()
+
 LOCAL_TZ = ZoneInfo("Europe/Moscow")
 
 WEEKDAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -123,6 +144,34 @@ WEEKDAYS_RU: dict[str, int] = {
     "воскресенье": 6, "воскресенья": 6,
 }
 
+MONTHS_RU_GENITIVE: dict[str, int] = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+_MONTH_NAMES_PAT = "|".join(MONTHS_RU_GENITIVE.keys())
+
+# "16 июля 10:00", "16 июля в 10:00", "16 июля 2026 10:00"
+_RU_MONTH_TIME_RE = re.compile(
+    r"\b(\d{1,2})\s+(" + _MONTH_NAMES_PAT + r")\b"
+    r"(?:\s+(\d{4}))?"
+    r"\s+(?:в\s+)?(\d{1,2}):(\d{2})",
+    re.IGNORECASE,
+)
+# "16 июля в 18" — bare 24h hour
+_RU_MONTH_BARE_HOUR_RE = re.compile(
+    r"\b(\d{1,2})\s+(" + _MONTH_NAMES_PAT + r")\b"
+    r"(?:\s+(\d{4}))?"
+    r"\s+(?:в\s+)?(\d{1,2})\b(?!:)",
+    re.IGNORECASE,
+)
+# "16 июля" alone (default time 09:00)
+_RU_MONTH_ONLY_RE = re.compile(
+    r"\b(\d{1,2})\s+(" + _MONTH_NAMES_PAT + r")\b"
+    r"(?:\s+(\d{4}))?",
+    re.IGNORECASE,
+)
+
 _RECURRENCE_RE = re.compile(
     r"\b("
     r"каждый\s+день|ежедневно"
@@ -157,6 +206,8 @@ _AMPM_RE = re.compile(
     r"\bв\s+(\d{1,2})(?::(\d{2}))?\s+(утра|утром|дня|днём|вечера|вечером|ночи|ночью)\b",
     re.IGNORECASE,
 )
+# "в 18" — bare 24h hour (matches only when NOT followed by am/pm and NOT preceded by weekday/month)
+_BARE_HOUR_RE = re.compile(r"\bв\s+(\d{1,2})\b(?!\s*:)(?!\s*(?:утра|утром|дня|днём|вечера|вечером|ночи|ночью))", re.IGNORECASE)
 
 def _ampm_to_hour(h: int, period: str) -> int:
     """Конвертирует '6 вечера' → 18, '9 утра' → 9, '11 ночи' → 23."""
@@ -177,6 +228,19 @@ _WEEKDAY_TIME_RE = re.compile(
 
 def _now() -> datetime:
     return datetime.now(tz=LOCAL_TZ)
+
+
+def _ru_month_deadline(day: int, month: int, year: Optional[int], hour: int, minute: int) -> Optional[datetime]:
+    """Calculates deadline from Russian month name. If year omitted and date is past, rolls to next year."""
+    now = _now()
+    try:
+        y = year if year else now.year
+        dl = datetime(y, month, day, hour, minute, tzinfo=LOCAL_TZ)
+        if year is None and dl <= now:
+            dl = dl.replace(year=y + 1)
+        return dl
+    except ValueError:
+        return None
 
 
 def _next_weekday(weekday: int, hour: int = 9, minute: int = 0) -> datetime:
@@ -273,6 +337,29 @@ def parse_task(raw: str) -> Optional[ParsedTask]:
     def _pt(desc: str, dl: datetime, rem: Optional[int] = None) -> ParsedTask:
         return ParsedTask(desc, dl, rem, recurrence, priority, category)
 
+    # "16 июля 10:00" / "16 июля в 10:00" / "16 июля 2026 10:00"
+    m = _RU_MONTH_TIME_RE.search(text)
+    if m:
+        day, month_name = int(m.group(1)), m.group(2).lower()
+        month = MONTHS_RU_GENITIVE.get(month_name)
+        year = int(m.group(3)) if m.group(3) else None
+        if month:
+            deadline = _ru_month_deadline(day, month, year, int(m.group(4)), int(m.group(5)))
+            if deadline:
+                return _pt(_clean(text, m), deadline, _resolve_reminder(deadline, rel_min, at_hm))
+
+    # "16 июля в 18" — bare 24h hour
+    m = _RU_MONTH_BARE_HOUR_RE.search(text)
+    if m:
+        day, month_name = int(m.group(1)), m.group(2).lower()
+        month = MONTHS_RU_GENITIVE.get(month_name)
+        year = int(m.group(3)) if m.group(3) else None
+        h = int(m.group(4))
+        if month and 0 <= h <= 23:
+            deadline = _ru_month_deadline(day, month, year, h, 0)
+            if deadline:
+                return _pt(_clean(text, m), deadline, _resolve_reminder(deadline, rel_min, at_hm))
+
     # DD.MM[.YYYY] HH:MM
     m = _DATE_TIME_RE.search(text)
     if m:
@@ -329,6 +416,15 @@ def parse_task(raw: str) -> Optional[ParsedTask]:
         ).strip(" ,.-") or raw.strip()
         return _pt(desc, deadline, _resolve_reminder(deadline, rel_min, at_hm))
 
+    # послезавтра в 18 — bare 24h hour
+    m_str = re.search(r"послезавтра\s+в\s+(\d{1,2})\b(?!:)", lower)
+    if m_str:
+        h = int(m_str.group(1))
+        if 0 <= h <= 23:
+            deadline = (now + timedelta(days=2)).replace(hour=h, minute=0, second=0, microsecond=0)
+            desc = re.sub(r"послезавтра\s+в\s+\d{1,2}\b", "", text, flags=re.IGNORECASE).strip(" ,.-") or raw.strip()
+            return _pt(desc, deadline, _resolve_reminder(deadline, rel_min, at_hm))
+
     # завтра HH:MM  или  завтра в HH:MM
     m_str = re.search(r"завтра\s+(?:в\s+)?(\d{1,2}):(\d{2})", lower)
     if m_str:
@@ -354,6 +450,15 @@ def parse_task(raw: str) -> Optional[ParsedTask]:
         ).strip(" ,.-") or raw.strip()
         return _pt(desc, deadline, _resolve_reminder(deadline, rel_min, at_hm))
 
+    # завтра в 18 — bare 24h hour
+    m_str = re.search(r"завтра\s+в\s+(\d{1,2})\b(?!:)", lower)
+    if m_str:
+        h = int(m_str.group(1))
+        if 0 <= h <= 23:
+            deadline = (now + timedelta(days=1)).replace(hour=h, minute=0, second=0, microsecond=0)
+            desc = re.sub(r"завтра\s+в\s+\d{1,2}\b", "", text, flags=re.IGNORECASE).strip(" ,.-") or raw.strip()
+            return _pt(desc, deadline, _resolve_reminder(deadline, rel_min, at_hm))
+
     # "в 6 вечера", "в 9 утра", "в 3 дня", "в 11 ночи"
     m = _AMPM_RE.search(text)
     if m:
@@ -364,6 +469,16 @@ def parse_task(raw: str) -> Optional[ParsedTask]:
             deadline += timedelta(days=1)
         return _pt(_clean(text, m), deadline, _resolve_reminder(deadline, rel_min, at_hm))
 
+    # "в 18" — bare 24h hour without am/pm suffix
+    m = _BARE_HOUR_RE.search(text)
+    if m:
+        h = int(m.group(1))
+        if 0 <= h <= 23:
+            deadline = now.replace(hour=h, minute=0, second=0, microsecond=0)
+            if deadline <= now:
+                deadline += timedelta(days=1)
+            return _pt(_clean(text, m), deadline, _resolve_reminder(deadline, rel_min, at_hm))
+
     # сегодня HH:MM или просто HH:MM
     m = _TIME_RE.search(text)
     if m:
@@ -371,6 +486,17 @@ def parse_task(raw: str) -> Optional[ParsedTask]:
         if deadline <= now:
             deadline += timedelta(days=1)
         return _pt(_clean(text, m), deadline, _resolve_reminder(deadline, rel_min, at_hm))
+
+    # "16 июля" — Russian month name only, default time 09:00
+    m = _RU_MONTH_ONLY_RE.search(text)
+    if m:
+        day, month_name = int(m.group(1)), m.group(2).lower()
+        month = MONTHS_RU_GENITIVE.get(month_name)
+        year = int(m.group(3)) if m.group(3) else None
+        if month:
+            deadline = _ru_month_deadline(day, month, year, 9, 0)
+            if deadline:
+                return _pt(_clean(text, m), deadline, _resolve_reminder(deadline, rel_min, at_hm))
 
     return None
 
@@ -451,15 +577,27 @@ async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     tasks = db.get_tasks_for_range(user_id, start, end)
-    if not tasks:
+    overdue = db.get_overdue_tasks(user_id)
+
+    if not tasks and not overdue:
         return
 
-    overdue = db.get_overdue_tasks(user_id)
-    overdue_note = f"\n⚠️ Просроченных: *{len(overdue)}* — /overdue" if overdue else ""
+    lines = [f"☀️ *Доброе утро!*"]
 
-    lines = [f"☀️ *Доброе утро!*\n📋 Задачи на сегодня, {now.strftime('%d.%m.%Y')} ({len(tasks)}){overdue_note}:"]
-    for i, t in enumerate(tasks, 1):
-        lines.append(_digest_line(i, t))
+    if tasks:
+        lines.append(f"\n📋 *Задачи на сегодня, {now.strftime('%d.%m.%Y')}* ({len(tasks)}):")
+        for i, t in enumerate(tasks, 1):
+            lines.append(_digest_line(i, t))
+
+    if overdue:
+        lines.append(f"\n⚠️ *Просроченные задачи* ({len(overdue)}):")
+        for i, t in enumerate(overdue, 1):
+            dl = datetime.fromisoformat(t["deadline"])
+            cat = f" #{t['category']}" if t["category"] else ""
+            pri = PRIORITY_EMOJI.get(t["priority"] if "priority" in t.keys() else 0, "")
+            prefix = f"{pri} " if pri else ""
+            lines.append(f"{i}. {prefix}{t['text']}{cat} — 🕐 {dl.strftime('%d.%m %H:%M')} [#{t['id']}]")
+        lines.append("Используй /overdue для управления ими.")
 
     try:
         await context.bot.send_message(chat_id=user_id, text="\n".join(lines), parse_mode="Markdown")
@@ -573,7 +711,8 @@ HELP_TEXT = (
     "  Любой хештег: *#работа*, *#семья*, *#личное* и др.\n\n"
     "*Примеры:*\n"
     "  Звонок партнёру завтра 15:00 #работа срочно напомни за 30 минут\n"
-    "  Купить торт для сына завтра в 6 вечера #семья\n"
+    "  Позвонить врачу в 18 #личное\n"
+    "  Купить торт 16 июля в 6 вечера #семья\n"
     "  Встреча 12.06 14:00 важно напомни в 13:30\n"
     "  Таблетки через 2 часа #личное\n\n"
     "*Команды:*\n"
@@ -583,7 +722,7 @@ HELP_TEXT = (
     "  /overdue — ⚠️ просроченные задачи\n"
     "  /done <id> — ✅ отметить выполненной\n"
     "  /del <id> — 🗑 удалить задачу\n"
-    "  /edit <id> <текст + время> — ✏️ изменить\n"
+    "  /edit — ✏️ изменить (выбор из списка)\n"
     "  /history — 📜 выполненные задачи\n"
     "  /family — 👨‍👩‍👦 семейный список\n"
     "  /setdigest 08:30 — ⏰ утренняя сводка\n"
@@ -660,6 +799,19 @@ def _priority_keyboard(task_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("⚪ Обычная", callback_data=f"pri:{task_id}:0"),
         ],
     ])
+
+
+def _edit_pick_keyboard(tasks: list) -> InlineKeyboardMarkup:
+    """Список активных задач для интерактивного выбора редактирования."""
+    buttons = []
+    for t in tasks:
+        dl = datetime.fromisoformat(t["deadline"])
+        label_text = t["text"] if len(t["text"]) <= 28 else t["text"][:25] + "..."
+        cat = f" #{t['category']}" if t["category"] else ""
+        label = f"{label_text}{cat} ({dl.strftime('%d.%m %H:%M')})"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"edit_pick:{t['id']}")])
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="edit_pick:cancel")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def _fmt_task(t: sqlite3.Row, num: Optional[int] = None) -> str:
@@ -782,9 +934,20 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     args = context.args
+
+    # No args → show interactive task picker
     if not args or not args[0].isdigit():
-        await update.message.reply_text("Использование: /edit <id> <новый текст + время>")
+        tasks = db.get_active_tasks(user_id)
+        if not tasks:
+            await update.message.reply_text("📭 Нет активных задач для редактирования.")
+            return
+        await update.message.reply_text(
+            "✏️ *Выбери задачу для редактирования:*",
+            parse_mode="Markdown",
+            reply_markup=_edit_pick_keyboard(tasks),
+        )
         return
+
     task_id = int(args[0])
     new_text = " ".join(args[1:])
     if not new_text:
@@ -1016,6 +1179,64 @@ async def _cascade_family_status(
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     text = update.message.text.strip()
+
+    # Handle interactive /edit state
+    editing_task_id: Optional[int] = context.user_data.pop("editing_task_id", None)
+    if editing_task_id is not None:
+        if text.lower() in ("отмена", "отменить", "/отмена"):
+            await update.message.reply_text("❌ Редактирование отменено.")
+            return
+        parsed = parse_task(text)
+        if parsed is None:
+            await update.message.reply_text(
+                "🤔 Не смог распознать время в новом тексте. Попробуй ещё раз.\n"
+                "_(Для отмены напиши «отмена»)_",
+                parse_mode="Markdown",
+            )
+            context.user_data["editing_task_id"] = editing_task_id
+            return
+        for job in context.job_queue.get_jobs_by_name(f"task_{editing_task_id}"):
+            job.schedule_removal()
+        if db.update_task(editing_task_id, user_id, parsed.text, parsed.deadline):
+            _schedule_task(context.application, editing_task_id, user_id, parsed.text,
+                           parsed.deadline, parsed.reminder_minutes, parsed.recurrence)
+            await update.message.reply_text(
+                f"✏️ Задача #{editing_task_id} обновлена:\n\n"
+                f"*{parsed.text}*\n"
+                f"🕐 {parsed.deadline.strftime('%d.%m.%Y %H:%M')}",
+                parse_mode="Markdown",
+                reply_markup=_task_keyboard(editing_task_id),
+            )
+            # Family cascade
+            updated = db.get_task(editing_task_id)
+            linked_id = updated["linked_task_id"] if updated and "linked_task_id" in updated.keys() else None
+            if linked_id:
+                linked = db.get_task(linked_id)
+                if linked and linked["status"] == "active":
+                    partner_id = linked["user_id"]
+                    for job in context.application.job_queue.get_jobs_by_name(f"task_{linked_id}"):
+                        job.schedule_removal()
+                    db.update_task_force(linked_id, parsed.text, parsed.deadline)
+                    _schedule_task(context.application, linked_id, partner_id, parsed.text,
+                                   parsed.deadline, linked["reminder_minutes"], linked["recurrence"])
+                    actor = update.effective_user.first_name or "Партнёр"
+                    try:
+                        await context.bot.send_message(
+                            chat_id=partner_id,
+                            text=(
+                                f"✏️ *{actor}* изменил семейную задачу:\n\n"
+                                f"📝 *{parsed.text}*\n"
+                                f"🕐 {parsed.deadline.strftime('%d.%m.%Y %H:%M')}"
+                            ),
+                            parse_mode="Markdown",
+                            reply_markup=_task_keyboard(linked_id),
+                        )
+                    except Exception:
+                        logger.exception("Failed to notify partner %d about edit.", partner_id)
+        else:
+            await update.message.reply_text("❌ Задача не найдена.")
+        return
+
     parsed = parse_task(text)
 
     if parsed is None:
@@ -1164,6 +1385,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="Markdown",
         )
 
+    elif data.startswith("edit_pick:"):
+        val = data.split(":", 1)[1]
+        if val == "cancel":
+            await query.edit_message_text("❌ Редактирование отменено.")
+            return
+        task_id = int(val)
+        task = db.get_task(task_id)
+        if not task or task["user_id"] != user_id or task["status"] != "active":
+            await query.answer("Задача не найдена.", show_alert=True)
+            return
+        context.user_data["editing_task_id"] = task_id
+        dl = datetime.fromisoformat(task["deadline"])
+        cat_note = f" #{task['category']}" if task["category"] else ""
+        await query.edit_message_text(
+            f"✏️ *Редактирую задачу #{task_id}:*\n\n"
+            f"📝 {task['text']}{cat_note}\n"
+            f"🕐 {dl.strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"Напиши новый текст и время.\n"
+            f"_(Для отмены напиши «отмена»)_",
+            parse_mode="Markdown",
+        )
+
     elif data.startswith("cat:"):
         parts = data.split(":", 2)
         task_id = int(parts[1])
@@ -1175,10 +1418,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         category = None if cat_val == "skip" else cat_val
         db.set_task_category(task_id, category)
         cat_label = f" #{category}" if category else " без категории"
-        # Показываем кнопки приоритета следующим шагом
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(
-            f"📂 Категория{cat_label} ✓\n\n🎯 Теперь выбери важность:",
+        # Rebuild message context from task data
+        dl = datetime.fromisoformat(task["deadline"])
+        rec_note = f"\n↩ Повтор: *{recurrence_label(task['recurrence'])}*" if task["recurrence"] else ""
+        if task["reminder_minutes"]:
+            remind_at = dl - timedelta(minutes=task["reminder_minutes"])
+            rem_note = f"\n🔔 Напомню в {remind_at.strftime('%H:%M')}"
+        else:
+            rem_note = "\n🔕 Без напоминания"
+        cat_display = f" #{category}" if category else ""
+        # Edit in place — no new message, chat stays clean
+        await query.edit_message_text(
+            f"✅ *Задача сохранена!*\n\n"
+            f"📝 *{task['text']}*{cat_display}\n"
+            f"🕐 {dl.strftime('%d.%m.%Y %H:%M')}"
+            f"{rec_note}{rem_note}\n\n"
+            f"📂 Категория{cat_label} ✓\n\n"
+            f"🎯 Теперь выбери важность:",
             parse_mode="Markdown",
             reply_markup=_priority_keyboard(task_id),
         )
@@ -1205,13 +1461,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         dl = datetime.fromisoformat(task["deadline"])
         cat_note = f" #{task['category']}" if task["category"] else ""
         pri_emoji = PRIORITY_EMOJI.get(priority, "")
-        pri_label = f" {pri_emoji}" if pri_emoji else " обычная"
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(
-            f"🎯 Важность{pri_label} ✓\n\n"
-            f"✅ *Всё готово!*\n\n"
+        pri_display = f" {pri_emoji}" if pri_emoji else ""
+        rec_note = f"\n↩ Повтор: *{recurrence_label(task['recurrence'])}*" if task["recurrence"] else ""
+        if task["reminder_minutes"]:
+            remind_at = dl - timedelta(minutes=task["reminder_minutes"])
+            rem_note = f"\n🔔 Напомню в {remind_at.strftime('%H:%M')}"
+        else:
+            rem_note = "\n🔕 Без напоминания"
+        # Edit in place with final task card — chat stays clean
+        await query.edit_message_text(
+            f"✅ Задача добавлена!{pri_display}\n\n"
             f"📝 *{task['text']}*{cat_note}\n"
-            f"🕐 {dl.strftime('%d.%m.%Y %H:%M')}",
+            f"🕐 {dl.strftime('%d.%m.%Y %H:%M')}"
+            f"{rec_note}{rem_note}",
             parse_mode="Markdown",
             reply_markup=_task_keyboard(task_id),
         )
@@ -1220,6 +1482,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
+
+_last_heartbeat: datetime = datetime.now(tz=LOCAL_TZ)
+
+
+async def _heartbeat_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic liveness check. Updates heartbeat timestamp every 5 minutes.
+    If the watchdog detects the heartbeat hasn't updated in >15 minutes,
+    it means the job queue is stuck and forces a process restart so Railway
+    can restart a clean instance."""
+    global _last_heartbeat
+    _last_heartbeat = datetime.now(tz=LOCAL_TZ)
+    logger.debug("Heartbeat OK at %s", _last_heartbeat.strftime("%H:%M:%S"))
+
+
+async def _watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checks that heartbeat is fresh. Exits the process if job queue is stuck."""
+    age = (datetime.now(tz=LOCAL_TZ) - _last_heartbeat).total_seconds()
+    if age > 900:  # 15 minutes without heartbeat = something is wrong
+        logger.error(
+            "Watchdog: heartbeat is %.0fs old (>900s). Job queue may be stuck. Forcing restart.",
+            age,
+        )
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_message(
+                f"Tasksbot watchdog triggered: heartbeat {age:.0f}s old, forcing restart.",
+                level="error",
+            )
+            sentry_sdk.flush(timeout=3)
+        except Exception:
+            pass
+        os._exit(1)  # non-zero exit → Railway restarts the worker
+    else:
+        logger.debug("Watchdog OK: heartbeat %.0fs ago.", age)
+
 
 async def on_startup(app: Application) -> None:
     db.init_db()
@@ -1260,6 +1557,12 @@ async def on_startup(app: Application) -> None:
     for user_id in db.get_all_users():
         _schedule_auto_digests(app, user_id)
     logger.info("Scheduled auto morning/evening digests.")
+
+    # Watchdog: heartbeat every 5 min, watchdog check every 10 min
+    from datetime import time as _time
+    app.job_queue.run_repeating(_heartbeat_job, interval=300, first=30, name="heartbeat")
+    app.job_queue.run_repeating(_watchdog_job, interval=600, first=60, name="watchdog")
+    logger.info("Watchdog started.")
 
 
 # ---------------------------------------------------------------------------
